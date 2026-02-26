@@ -1,4 +1,4 @@
-import os, time, hashlib, tempfile, re
+import os, time, hashlib, tempfile, re, json
 from datetime import datetime
 import requests
 import streamlit as st
@@ -18,6 +18,7 @@ st.title("📄💬 10-K RAG Chat (Ollama + Multi-API + Disk Cache + Parallel Emb
 perf_panel_placeholder = st.empty()
 
 CACHE_ROOT = r"D:\Ollama\vector_cache"
+HISTORY_PATH = os.path.join(CACHE_ROOT, "chat_history.json")
 
 DEFAULT_PERSONA = 'You are a careful assistant. Use ONLY the provided context. If the answer is not supported by the context, say: "I don\'t have enough information to answer this question." Always cite page numbers and quote short phrases as evidence. Do not guess.'
 PROMPT_GENERAL = ChatPromptTemplate.from_template(
@@ -153,6 +154,17 @@ def format_docs(docs):
         blocks.append(f"[Chunk {i} | Page {page}]\n{d.page_content}")
     return "\n\n---\n\n".join(blocks)
 
+def summarize_title(messages) -> str:
+    if not messages:
+        return "New chat"
+    last_user = next((m["content"] for m in reversed(messages) if m.get("role") == "user"), "")
+    text = (last_user or "").replace("\n", " ").strip()
+    if not text:
+        return "New chat"
+    if len(text) > 60:
+        return text[:60].rstrip() + "..."
+    return text
+
 def excerpt(text: str, start: int, size: int = 180) -> str:
     t = (text or "").replace("\n", " ").strip()
     if not t:
@@ -207,6 +219,54 @@ def build_answer_citations(answer: str, docs, max_items: int = 5) -> list[dict]:
         if len(rows) >= max_items:
             break
     return rows
+
+def load_history_file() -> dict:
+    if not os.path.isfile(HISTORY_PATH):
+        return {"sessions": [], "active_id": None}
+    try:
+        with open(HISTORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"sessions": [], "active_id": None}
+        if "sessions" not in data or not isinstance(data["sessions"], list):
+            data["sessions"] = []
+        return data
+    except Exception:
+        return {"sessions": [], "active_id": None}
+
+def save_history_file(data: dict) -> None:
+    os.makedirs(CACHE_ROOT, exist_ok=True)
+    try:
+        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=True, indent=2)
+    except Exception:
+        pass
+
+def new_session(title: str | None = None) -> dict:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sid = sha256_str(f"{now}-{time.time()}")[:12]
+    return {
+        "id": sid,
+        "title": title or f"Chat {now}",
+        "messages": [],
+        "citation_history": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+
+def sync_active_session() -> None:
+    data = st.session_state.history_store
+    sid = st.session_state.active_session_id
+    sessions = data.get("sessions", [])
+    for s in sessions:
+        if s.get("id") == sid:
+            s["messages"] = st.session_state.messages
+            s["citation_history"] = st.session_state.citation_history
+            s["title"] = summarize_title(st.session_state.messages)
+            s["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            break
+    data["active_id"] = sid
+    save_history_file(data)
 
 def capture_docs(label):
     def _cap(docs):
@@ -555,6 +615,24 @@ if "last_answer_bucket" not in st.session_state:
     st.session_state.last_answer_bucket = "All"
 if "citation_history" not in st.session_state:
     st.session_state.citation_history = []
+if "history_loaded" not in st.session_state:
+    st.session_state.history_store = load_history_file()
+    if not st.session_state.history_store.get("sessions"):
+        session = new_session()
+        st.session_state.history_store["sessions"] = [session]
+        st.session_state.history_store["active_id"] = session["id"]
+        save_history_file(st.session_state.history_store)
+
+    st.session_state.active_session_id = st.session_state.history_store.get("active_id")
+    if not st.session_state.active_session_id:
+        st.session_state.active_session_id = st.session_state.history_store["sessions"][0]["id"]
+
+    for s in st.session_state.history_store["sessions"]:
+        if s.get("id") == st.session_state.active_session_id:
+            st.session_state.messages = s.get("messages", [])
+            st.session_state.citation_history = s.get("citation_history", [])
+            break
+    st.session_state.history_loaded = True
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -628,7 +706,6 @@ with st.sidebar:
 
     st.divider()
     rebuild = st.button("🔄 Force rebuild indexes")
-    clear_chat = st.button("🧹 Clear chat")
 
 
 providers = []
@@ -696,10 +773,8 @@ with st.sidebar:
 
 
 uploaded = st.file_uploader("Upload PDFs", accept_multiple_files=True, type=["pdf"])
-
-if clear_chat:
-    st.session_state.messages = []
-    st.session_state.last_retrieved = {k: [] for k in st.session_state.bucket_labels}
+clear_chat = False
+new_chat = False
 
 def current_store_key():
     if not uploaded:
@@ -764,6 +839,23 @@ with col1:
             st.markdown(m["content"])
 
 with col2:
+    st.subheader("Chat Sessions")
+    clear_chat = st.button("🧹 Clear chat", use_container_width=True)
+    new_chat = st.button("🆕 New chat", use_container_width=True)
+
+    sessions = st.session_state.history_store.get("sessions", [])
+    if sessions:
+        for s in reversed(sessions):
+            label = f"{s.get('title', 'Chat')} · {s.get('updated_at', '')}"
+            if st.button(label, key=f"session_{s.get('id')}"):
+                st.session_state.active_session_id = s.get("id")
+                st.session_state.messages = s.get("messages", [])
+                st.session_state.citation_history = s.get("citation_history", [])
+                st.rerun()
+    else:
+        st.caption("No sessions found.")
+
+    st.divider()
     st.subheader("Detected Buckets")
     bucket_rows = [{"Bucket": k, "Chunks": v} for k, v in st.session_state.bucket_stats.items() if k in st.session_state.bucket_labels]
     if bucket_rows:
@@ -817,10 +909,27 @@ with col2:
             else:
                 st.caption("No citations captured for this question.")
 
+    if clear_chat:
+        st.session_state.messages = []
+        st.session_state.last_retrieved = {k: [] for k in st.session_state.bucket_labels}
+        st.session_state.citation_history = []
+        sync_active_session()
+
+    if new_chat:
+        session = new_session()
+        st.session_state.history_store["sessions"].append(session)
+        st.session_state.active_session_id = session["id"]
+        st.session_state.messages = []
+        st.session_state.citation_history = []
+        st.session_state.last_retrieved = {k: [] for k in st.session_state.bucket_labels}
+        sync_active_session()
+        st.rerun()
+
 q = st.chat_input("Ask about the uploaded 10-Ks...")
 
 if q:
     st.session_state.messages.append({"role": "user", "content": q})
+    sync_active_session()
     with st.chat_message("user"):
         st.markdown(q)
 
@@ -894,4 +1003,5 @@ if q:
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "citations": st.session_state.last_citations,
     })
+    sync_active_session()
     st.rerun()
