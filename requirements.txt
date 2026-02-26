@@ -1,0 +1,21 @@
+# Web Framework & Utils
+streamlit>=1.32.0
+requests
+psutil>=5.9.0
+
+# Document Parsing
+pymupdf>=1.23.0
+
+# Vector Store
+faiss-cpu>=1.8.0
+
+# LangChain Ecosystem
+langchain-core>=0.1.30
+langchain-community>=0.0.25
+langchain-text-splitters>=0.0.1
+
+# LLM & Embedding Providers Integrations
+langchain-ollama>=0.0.1
+langchain-openai>=0.1.0
+langchain-google-genai>=1.0.0
+google-generativeai>=0.4.0
